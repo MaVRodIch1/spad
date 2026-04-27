@@ -6,3 +6,6 @@ __pycache__/
 .venv/
 venv/
 structure.json
+bundle/
+bundle_report.json
+webapp_routes.json
