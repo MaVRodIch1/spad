@@ -621,11 +621,8 @@ def format_tg_message(s: dict[str, Any]) -> str:
         parts.append(f"<b>Creator wallet:</b> <code>{html_escape(creator_addr)}</code>")
     if contract:
         parts.append(f"<b>Contract:</b> <code>{html_escape(contract)}</code>")
-    web_url = s.get("web_url") or ""
     if url:
         parts.append(f'<a href="{html_escape(url)}">▶ Open in Telegram</a>')
-    if web_url:
-        parts.append(f'<a href="{html_escape(web_url)}">Open in browser</a>')
     return "\n".join(parts)
 
 
