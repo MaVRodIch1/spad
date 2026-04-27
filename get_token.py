@@ -237,6 +237,41 @@ async def try_auth(client: httpx.AsyncClient, init_data: str) -> dict | None:
     return None
 
 
+async def get_fresh_token(verbose: bool = False) -> str:
+    """Получает новый JWT-токен. Сохраняет результат в auth.json. Возвращает токен.
+    Используется и из CLI (main), и из monitor_launches при 401."""
+    if verbose:
+        print(f"[*] Получаю initData через Telethon (peer={TARGET}, url={WEBAPP_URL})…")
+    variants = await fetch_init_data_variants()
+    if not variants:
+        raise RuntimeError("Не удалось получить ни одного initData")
+
+    async with httpx.AsyncClient() as http:
+        for label, init_data in variants:
+            if verbose:
+                print(f"\n=== initData: {label} ===")
+            result = await try_auth(http, init_data)
+            if result:
+                OUT_FILE.write_text(
+                    json.dumps(
+                        {
+                            "saved_at": datetime.now(timezone.utc).isoformat(),
+                            "init_data_method": label,
+                            "auth_path": result["path"],
+                            "auth_label": result["label"],
+                            "init_data": init_data,
+                            "token": result["token"],
+                            "response": result["response"],
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                return result["token"]
+    raise RuntimeError("Auth не сработал ни для одного варианта initData")
+
+
 async def main() -> None:
     print(f"[*] Получаю initData через Telethon (peer={TARGET}, url={WEBAPP_URL})…")
     variants = await fetch_init_data_variants()
@@ -276,7 +311,7 @@ async def main() -> None:
                 print(f"    initData получен через: {label}")
                 print(f"    auth: {result['path']}  [{result['label']}]")
                 print(f"    Сохранил в {OUT_FILE}")
-                print("\nЗапусти monitor так:")
+                print("\nЗапусти monitor так (или просто запусти без AUTH_HEADER — он сам подхватит auth.json):")
                 print(
                     f"  AUTH_HEADER='Authorization: Bearer {result['token']}' "
                     "python monitor_launches.py"

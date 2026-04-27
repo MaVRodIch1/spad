@@ -14,13 +14,18 @@ launch_id в state-файле, для каждого нового пишет в 
     # один проход, без цикла:
     POLL_INTERVAL=0 python monitor_launches.py
 
-Если эндпоинт потребует авторизацию, прокинь хедер через env:
-    AUTH_HEADER='Authorization: Bearer <token>'   (или X-Telegram-Init-Data: ...)
+Авторизация:
+  - Если есть auth.json (от get_token.py) — токен подхватится автоматически.
+  - При получении 401 монитор сам вызовет get_token.get_fresh_token() и
+    обновит auth.json — для этого .env с TG_API_ID/TG_API_HASH/TG_PHONE
+    должен быть на месте.
+  - Можно явно передать AUTH_HEADER=... — тогда автообновление выключено.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import sys
@@ -38,7 +43,10 @@ POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "30"))
 STATE_FILE = Path(os.environ.get("STATE_FILE", "launches_seen.json"))
 LOG_FILE = Path(os.environ.get("LOG_FILE", "launches.jsonl"))
 TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "20"))
-AUTH_HEADER = os.environ.get("AUTH_HEADER", "").strip()
+AUTH_HEADER_ENV = os.environ.get("AUTH_HEADER", "").strip()
+AUTH_FILE = Path(os.environ.get("AUTH_OUT", "auth.json"))
+# обновлять токен заранее за N секунд до exp
+TOKEN_REFRESH_LEAD = int(os.environ.get("TOKEN_REFRESH_LEAD", "120"))
 
 # Уведомления в TG-канал (опционально)
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
@@ -51,12 +59,90 @@ UA = (
 )
 
 
+# --- управление токеном ---------------------------------------------------
+
+class TokenStore:
+    """Хранит текущий JWT и умеет его обновлять через get_token.get_fresh_token."""
+
+    def __init__(self) -> None:
+        self.token: str | None = None
+        self.exp: int | None = None
+        self.locked_to_env = False
+
+    def jwt_exp(self, jwt: str) -> int | None:
+        try:
+            _, payload, _ = jwt.split(".")
+            payload += "=" * (-len(payload) % 4)
+            data = json.loads(base64.urlsafe_b64decode(payload))
+            exp = data.get("exp")
+            return int(exp) if isinstance(exp, (int, float)) else None
+        except Exception:
+            return None
+
+    def load(self) -> None:
+        # 1) Явный AUTH_HEADER в env — значит юзер сам управляет, авторефреш off
+        if AUTH_HEADER_ENV and ":" in AUTH_HEADER_ENV:
+            name, _, value = AUTH_HEADER_ENV.partition(":")
+            value = value.strip()
+            if name.strip().lower() == "authorization" and value.lower().startswith("bearer "):
+                self.token = value.split(None, 1)[1]
+            else:
+                self.token = value
+            self.exp = self.jwt_exp(self.token) if self.token else None
+            self.locked_to_env = True
+            return
+
+        # 2) Иначе пробуем auth.json
+        if AUTH_FILE.exists():
+            try:
+                data = json.loads(AUTH_FILE.read_text(encoding="utf-8"))
+                tok = data.get("token")
+                if isinstance(tok, str) and tok:
+                    self.token = tok
+                    self.exp = self.jwt_exp(tok)
+            except Exception as e:
+                print(f"[!] Не смог прочитать {AUTH_FILE}: {e}", file=sys.stderr)
+
+    def is_expiring(self) -> bool:
+        if not self.token or not self.exp:
+            return False
+        return time.time() >= self.exp - TOKEN_REFRESH_LEAD
+
+    async def refresh(self) -> bool:
+        if self.locked_to_env:
+            print("[!] Токен задан явно через AUTH_HEADER, автообновление отключено.", file=sys.stderr)
+            return False
+        try:
+            from get_token import get_fresh_token
+        except ImportError as e:
+            print(f"[!] Не нашёл get_token.py: {e}", file=sys.stderr)
+            return False
+        try:
+            print(f"[*] Обновляю токен через get_token.get_fresh_token() …")
+            new_token = await get_fresh_token(verbose=False)
+            self.token = new_token
+            self.exp = self.jwt_exp(new_token)
+            print(f"[+] Новый токен получен (exp={self.exp})")
+            return True
+        except Exception as e:
+            print(f"[!] Не удалось обновить токен: {e}", file=sys.stderr)
+            return False
+
+
+TOKENS = TokenStore()
+
+
 def build_headers() -> dict[str, str]:
-    h = {"User-Agent": UA, "Accept": "application/json", "Origin": "https://stickerdom.store"}
-    if AUTH_HEADER and ":" in AUTH_HEADER:
-        name, _, value = AUTH_HEADER.partition(":")
-        h[name.strip()] = value.strip()
+    h = {
+        "User-Agent": UA,
+        "Accept": "application/json",
+        "Origin": "https://stickerdom.store",
+        "Referer": "https://stickerdom.store/",
+    }
+    if TOKENS.token:
+        h["Authorization"] = f"Bearer {TOKENS.token}"
     return h
+
 
 
 def load_seen() -> set[str]:
@@ -155,15 +241,28 @@ def extract_summary(item: dict) -> dict[str, Any]:
 async def fetch_launches(client: httpx.AsyncClient) -> list[dict]:
     url = f"{API_BASE}{STICKERPAD}/launch"
     params = {"approved": "true", "limit": str(LIMIT)}
-    r = await client.get(url, params=params, timeout=TIMEOUT)
-    if r.status_code == 401 or r.status_code == 403:
-        raise PermissionError(
-            f"{r.status_code} {r.reason_phrase}: эндпоинт требует авторизацию. "
-            "Передай AUTH_HEADER='Authorization: Bearer <token>' или "
-            "'X-Telegram-Init-Data: <initData>'."
-        )
+
+    # Проактивный refresh, если до exp осталось мало
+    if not TOKENS.locked_to_env and TOKENS.is_expiring():
+        await TOKENS.refresh()
+
+    r = await client.get(url, params=params, headers=build_headers(), timeout=TIMEOUT)
+    if r.status_code in (401, 403):
+        # Реактивный refresh: попробуем обновить токен и повторить запрос
+        if not TOKENS.locked_to_env:
+            print(f"[*] Получили {r.status_code}, пытаюсь обновить токен …")
+            if await TOKENS.refresh():
+                r = await client.get(url, params=params, headers=build_headers(), timeout=TIMEOUT)
+        if r.status_code in (401, 403):
+            raise PermissionError(
+                f"{r.status_code} {r.reason_phrase}: эндпоинт требует авторизацию. "
+                "Запусти `python get_token.py`, либо передай AUTH_HEADER явно."
+            )
     r.raise_for_status()
     data = r.json()
+    # Stickerdom оборачивает успешный ответ как {"ok":true,"data":{...}}
+    if isinstance(data, dict) and data.get("ok") is True and "data" in data:
+        data = data["data"]
 
     # Возможные форматы: {launches: [...]}, {pages: [{launches: [...]}, ...]}, {data: [...]}, [...]
     if isinstance(data, list):
@@ -291,13 +390,22 @@ async def run_once(client: httpx.AsyncClient, seen: set[str], first_run: bool) -
 
 async def main() -> None:
     seen = load_seen()
+    TOKENS.load()
+    if not TOKENS.token and not TOKENS.locked_to_env:
+        print("[*] auth.json пуст и AUTH_HEADER не задан — пробую получить токен сразу.")
+        await TOKENS.refresh()
     tg_status = "ON" if (TG_BOT_TOKEN and TG_CHAT_ID) else "OFF"
+    auth_status = (
+        "env" if TOKENS.locked_to_env
+        else f"file (exp={TOKENS.exp})" if TOKENS.token
+        else "none"
+    )
     print(
         f"[*] base={API_BASE}{STICKERPAD}  limit={LIMIT}  interval={POLL_INTERVAL}s  "
-        f"seen={len(seen)}  tg_notify={tg_status}"
+        f"seen={len(seen)}  tg_notify={tg_status}  auth={auth_status}"
     )
     first_run = len(seen) == 0
-    async with httpx.AsyncClient(headers=build_headers()) as client:
+    async with httpx.AsyncClient() as client:
         while True:
             try:
                 new = await run_once(client, seen, first_run)
