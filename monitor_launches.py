@@ -35,6 +35,9 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
 
 API_BASE = os.environ.get("API_BASE_URL", "https://api.stickerdom.store")
 STICKERPAD = os.environ.get("STICKERPAD_PATH", "/stickerpad/v1")
@@ -238,6 +241,65 @@ def extract_summary(item: dict) -> dict[str, Any]:
     }
 
 
+async def fetch_launch_detail(client: httpx.AsyncClient, launch_id: str) -> dict | None:
+    """GET /stickerpad/v1/launch/{id} — там обычно полная инфа, включая creator."""
+    if not launch_id:
+        return None
+    url = f"{API_BASE}{STICKERPAD}/launch/{launch_id}"
+
+    if not TOKENS.locked_to_env and TOKENS.is_expiring():
+        await TOKENS.refresh()
+
+    r = await client.get(url, headers=build_headers(), timeout=TIMEOUT)
+    if r.status_code in (401, 403) and not TOKENS.locked_to_env:
+        if await TOKENS.refresh():
+            r = await client.get(url, headers=build_headers(), timeout=TIMEOUT)
+    if r.status_code != 200:
+        print(f"[!] /launch/{launch_id} -> {r.status_code}", file=sys.stderr)
+        return None
+    try:
+        data = r.json()
+    except Exception:
+        return None
+    if isinstance(data, dict) and data.get("ok") is True and "data" in data:
+        return data["data"] if isinstance(data["data"], dict) else None
+    return data if isinstance(data, dict) else None
+
+
+def merge_detail_into_summary(s: dict[str, Any], detail: dict | None) -> None:
+    """Дописывает в summary creator/прочее из ответа /launch/{id}."""
+    if not isinstance(detail, dict):
+        return
+    # Возможные места, где лежит creator: detail.creator, detail.launch_info.creator,
+    # detail.launch_info.launch.creator, detail.user, detail.owner
+    candidates = []
+    candidates.append(detail.get("creator"))
+    candidates.append(detail.get("user"))
+    candidates.append(detail.get("owner"))
+    li = detail.get("launch_info")
+    if isinstance(li, dict):
+        candidates.append(li.get("creator"))
+        candidates.append(li.get("user"))
+        launch = li.get("launch")
+        if isinstance(launch, dict):
+            candidates.append(launch.get("creator"))
+            candidates.append(launch.get("user"))
+    creator = next((c for c in candidates if isinstance(c, dict) and c), None)
+    if creator:
+        s["creator"] = {
+            "id": first(creator, "id", "user_id", "telegram_id"),
+            "full_name": first(creator, "full_name", "name"),
+            "username": first(creator, "username"),
+        }
+    # Если в деталях есть более точный contract/start_price — обновим
+    li = detail.get("launch_info") if isinstance(detail.get("launch_info"), dict) else {}
+    launch = li.get("launch") if isinstance(li, dict) else None
+    if isinstance(launch, dict):
+        s["contract_address"] = first(launch, "contract_address") or s.get("contract_address")
+        s["start_price"] = first(launch, "start_price") or s.get("start_price")
+        s["end_price"] = first(launch, "end_price") or s.get("end_price")
+
+
 async def fetch_launches(client: httpx.AsyncClient) -> list[dict]:
     url = f"{API_BASE}{STICKERPAD}/launch"
     params = {"approved": "true", "limit": str(LIMIT)}
@@ -371,6 +433,7 @@ async def notify_telegram(client: httpx.AsyncClient, s: dict[str, Any]) -> None:
 async def run_once(client: httpx.AsyncClient, seen: set[str], first_run: bool) -> int:
     items = await fetch_launches(client)
     new_count = 0
+    will_notify = (not first_run) or NOTIFY_BACKLOG
     for item in items:
         s = extract_summary(item)
         lid = str(s["launch_id"]) if s["launch_id"] is not None else None
@@ -378,12 +441,20 @@ async def run_once(client: httpx.AsyncClient, seen: set[str], first_run: bool) -
             continue
         seen.add(lid)
         new_count += 1
+        # Если creator отсутствует — дотягиваем детали через /launch/{id}.
+        if not s["creator"].get("username") and not s["creator"].get("full_name"):
+            try:
+                detail = await fetch_launch_detail(client, lid)
+                merge_detail_into_summary(s, detail)
+            except Exception as e:
+                print(f"[!] detail({lid}): {e}", file=sys.stderr)
         print_launch(s)
         append_log(s)
-        # На первом запуске бэклог не шлём в TG, чтобы не флудить старыми лаунчами,
-        # если только NOTIFY_BACKLOG=1.
-        if not first_run or NOTIFY_BACKLOG:
+        if will_notify:
             await notify_telegram(client, s)
+            # лёгкий троттлинг, чтобы не словить 429 при backlog-рассылке
+            if NOTIFY_BACKLOG and first_run:
+                await asyncio.sleep(0.7)
     save_seen(seen)
     return new_count
 
