@@ -40,6 +40,11 @@ LOG_FILE = Path(os.environ.get("LOG_FILE", "launches.jsonl"))
 TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "20"))
 AUTH_HEADER = os.environ.get("AUTH_HEADER", "").strip()
 
+# Уведомления в TG-канал (опционально)
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()  # @channelname или -100...
+NOTIFY_BACKLOG = os.environ.get("NOTIFY_BACKLOG", "0") == "1"  # слать в TG для уже виденных при первом запуске
+
 UA = (
     "Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36 Telegram-Android/10.13"
@@ -200,7 +205,71 @@ def append_log(s: dict[str, Any]) -> None:
         f.write(line + "\n")
 
 
-async def run_once(client: httpx.AsyncClient, seen: set[str]) -> int:
+def html_escape(s: Any) -> str:
+    if s is None:
+        return ""
+    return (
+        str(s)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def format_tg_message(s: dict[str, Any]) -> str:
+    coll = s["collection"]
+    creator = s["creator"]
+    name = html_escape(s["name"]) or "—"
+    coll_title = html_escape(coll.get("title")) or "—"
+    coll_id = html_escape(coll.get("id"))
+    cu = creator.get("username")
+    cn = html_escape(creator.get("full_name")) or "—"
+    cid = html_escape(creator.get("id"))
+    creator_line = f"@{html_escape(cu)} ({cn})" if cu else cn
+    if cid:
+        creator_line += f" • <code>{cid}</code>"
+    status = html_escape(s["status"]) or "—"
+    start = html_escape(s["start_time"])
+    contract = s.get("contract_address")
+    url = s.get("url") or ""
+
+    parts = [
+        "🆕 <b>New Sticker Pack launch</b>",
+        f"<b>Pack:</b> {name}",
+        f"<b>Collection:</b> {coll_title}" + (f" (id <code>{coll_id}</code>)" if coll_id else ""),
+        f"<b>Creator:</b> {creator_line}",
+        f"<b>Status:</b> {status}   <b>Start:</b> {start}",
+    ]
+    if contract:
+        parts.append(f"<b>Contract:</b> <code>{html_escape(contract)}</code>")
+    if url:
+        parts.append(f'<a href="{html_escape(url)}">Open in Sticker Pack</a>')
+    return "\n".join(parts)
+
+
+async def notify_telegram(client: httpx.AsyncClient, s: dict[str, Any]) -> None:
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        return
+    text = format_tg_message(s)
+    payload = {
+        "chat_id": TG_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False,
+    }
+    try:
+        r = await client.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+            json=payload,
+            timeout=TIMEOUT,
+        )
+        if r.status_code != 200:
+            print(f"[!] TG notify failed {r.status_code}: {r.text[:300]}", file=sys.stderr)
+    except httpx.HTTPError as e:
+        print(f"[!] TG notify HTTP error: {e}", file=sys.stderr)
+
+
+async def run_once(client: httpx.AsyncClient, seen: set[str], first_run: bool) -> int:
     items = await fetch_launches(client)
     new_count = 0
     for item in items:
@@ -212,19 +281,33 @@ async def run_once(client: httpx.AsyncClient, seen: set[str]) -> int:
         new_count += 1
         print_launch(s)
         append_log(s)
+        # На первом запуске бэклог не шлём в TG, чтобы не флудить старыми лаунчами,
+        # если только NOTIFY_BACKLOG=1.
+        if not first_run or NOTIFY_BACKLOG:
+            await notify_telegram(client, s)
     save_seen(seen)
     return new_count
 
 
 async def main() -> None:
     seen = load_seen()
-    print(f"[*] base={API_BASE}{STICKERPAD}  limit={LIMIT}  interval={POLL_INTERVAL}s  seen={len(seen)}")
+    tg_status = "ON" if (TG_BOT_TOKEN and TG_CHAT_ID) else "OFF"
+    print(
+        f"[*] base={API_BASE}{STICKERPAD}  limit={LIMIT}  interval={POLL_INTERVAL}s  "
+        f"seen={len(seen)}  tg_notify={tg_status}"
+    )
+    first_run = len(seen) == 0
     async with httpx.AsyncClient(headers=build_headers()) as client:
         while True:
             try:
-                new = await run_once(client, seen)
+                new = await run_once(client, seen, first_run)
+                first_run = False
                 if new == 0:
-                    print(f"[.] {datetime.now().strftime('%H:%M:%S')}  no new launches  (total seen: {len(seen)})", flush=True)
+                    print(
+                        f"[.] {datetime.now().strftime('%H:%M:%S')}  no new launches  "
+                        f"(total seen: {len(seen)})",
+                        flush=True,
+                    )
             except PermissionError as e:
                 print(f"[!] {e}", file=sys.stderr)
                 return
