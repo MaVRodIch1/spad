@@ -41,19 +41,25 @@ SESSION = os.environ.get("TG_SESSION", "userbot")
 
 
 def serialize_button(btn: Any) -> dict[str, Any]:
+    # btn — это telethon.tl.custom.MessageButton (враппер).
+    # Реальный TL-объект лежит в btn.button.
+    inner = getattr(btn, "button", btn)
     out: dict[str, Any] = {
-        "type": type(btn).__name__,
-        "text": getattr(btn, "text", None),
+        "type": type(inner).__name__,
+        "text": getattr(inner, "text", None),
     }
-    data = getattr(btn, "data", None)
+    data = getattr(inner, "data", None)
     if data:
         try:
             out["data"] = data.decode("utf-8")
         except UnicodeDecodeError:
             out["data"] = data.hex()
-    url = getattr(btn, "url", None)
+    url = getattr(inner, "url", None)
     if url:
         out["url"] = url
+    query = getattr(inner, "query", None)
+    if query:
+        out["query"] = query
     return out
 
 
