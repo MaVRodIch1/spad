@@ -35,23 +35,43 @@ async def main() -> None:
         await TOKENS.refresh()
 
     url = f"{API_BASE}/api/v1/user/lookup"
-    print(f"[*] GET {url}?id={uid}")
+    print(f"[*] target: {url}  id={uid}")
+
+    if not TOKENS.locked_to_env and TOKENS.is_expiring():
+        await TOKENS.refresh()
+
+    candidates = [
+        ("POST query ?id=", lambda c: c.post(url, params={"id": uid}, headers=build_headers(), timeout=TIMEOUT)),
+        ("POST json {id: int}", lambda c: c.post(url, json={"id": int(uid)}, headers=build_headers(), timeout=TIMEOUT)),
+        ("POST json {id: str}", lambda c: c.post(url, json={"id": str(uid)}, headers=build_headers(), timeout=TIMEOUT)),
+        ("POST json {user_id: int}", lambda c: c.post(url, json={"user_id": int(uid)}, headers=build_headers(), timeout=TIMEOUT)),
+        ("POST form id=...", lambda c: c.post(url, data={"id": uid}, headers=build_headers(), timeout=TIMEOUT)),
+        ("POST raw body 'id=...'", lambda c: c.post(url, content=f"id={uid}", headers={**build_headers(), "Content-Type": "application/x-www-form-urlencoded"}, timeout=TIMEOUT)),
+    ]
+
     async with httpx.AsyncClient() as client:
-        r = await client.get(url, params={"id": uid}, headers=build_headers(), timeout=TIMEOUT)
-        if r.status_code in (401, 403) and not TOKENS.locked_to_env:
-            print(f"[*] {r.status_code}, обновляю токен …")
-            if await TOKENS.refresh():
-                r = await client.get(url, params={"id": uid}, headers=build_headers(), timeout=TIMEOUT)
-        print(f"[+] {r.status_code}\n")
-        print("-- Headers --")
-        for k, v in r.headers.items():
-            if k.lower() in {"content-type", "content-length", "x-request-id"}:
-                print(f"  {k}: {v}")
-        print("-- Body --")
-        try:
-            print(json.dumps(r.json(), ensure_ascii=False, indent=2))
-        except Exception:
-            print(r.text)
+        for label, do in candidates:
+            try:
+                r = await do(client)
+            except Exception as e:
+                print(f"\n=== {label} ===\n  exception: {e}")
+                continue
+            if r.status_code in (401, 403) and not TOKENS.locked_to_env:
+                if await TOKENS.refresh():
+                    r = await do(client)
+            print(f"\n=== {label} ===")
+            print(f"  status: {r.status_code}")
+            ct = r.headers.get("content-type", "")
+            print(f"  content-type: {ct}")
+            body = r.text
+            if "json" in ct:
+                try:
+                    body = json.dumps(r.json(), ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+            print("  body:")
+            for line in body.splitlines()[:30]:
+                print(f"    {line}")
 
 
 if __name__ == "__main__":
