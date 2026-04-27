@@ -167,7 +167,10 @@ def extract_token(payload: dict) -> str | None:
 
 
 async def try_auth(client: httpx.AsyncClient, init_data: str) -> dict | None:
-    """Бэк (см. бандл) ждёт POST /api/v1/auth с multipart/form-data полем initData."""
+    """В бандле: endpoint:"/auth", formData: a.initData — где a.initData это уже
+    готовая form-urlencoded строка (query_id=...&user=...&hash=...&signature=...).
+    Значит бэк ждёт сырую initData как HTTP body с Content-Type
+    application/x-www-form-urlencoded и парсит её как top-level form-поля."""
     headers_base = {
         "User-Agent": UA,
         "Accept": "application/json",
@@ -177,12 +180,32 @@ async def try_auth(client: httpx.AsyncClient, init_data: str) -> dict | None:
     path = "/api/v1/auth"
     url = f"{API_BASE}{path}"
 
-    # Главный кандидат — то, что реально шлёт фронт.
     candidates = [
+        (
+            "raw-body initData (Content-Type form-urlencoded)",
+            lambda: client.post(
+                url,
+                headers={**headers_base, "Content-Type": "application/x-www-form-urlencoded"},
+                content=init_data,
+                timeout=20,
+            ),
+        ),
+        (
+            "raw-body initData (no Content-Type)",
+            lambda: client.post(url, headers=headers_base, content=init_data, timeout=20),
+        ),
+        (
+            "raw-body initData (Content-Type text/plain)",
+            lambda: client.post(
+                url,
+                headers={**headers_base, "Content-Type": "text/plain"},
+                content=init_data,
+                timeout=20,
+            ),
+        ),
+        # Старые варианты на всякий случай
         ("multipart:initData", lambda: client.post(url, headers=headers_base, files={"initData": (None, init_data)}, timeout=20)),
         ("form:initData", lambda: client.post(url, headers=headers_base, data={"initData": init_data}, timeout=20)),
-        ("multipart:init_data", lambda: client.post(url, headers=headers_base, files={"init_data": (None, init_data)}, timeout=20)),
-        ("form:init_data", lambda: client.post(url, headers=headers_base, data={"init_data": init_data}, timeout=20)),
     ]
 
     for label, do_request in candidates:
