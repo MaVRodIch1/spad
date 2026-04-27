@@ -349,37 +349,60 @@ async def resolve_username(user_id: Any) -> dict[str, Any] | None:
 
 
 def merge_detail_into_summary(s: dict[str, Any], detail: dict | None) -> None:
-    """Дописывает в summary creator/прочее из ответа /launch/{id}."""
+    """Дописывает в summary creator/прочее из ответа /launch/{id}.
+
+    Реальная схема Stickerpad (увидено через inspect_launch.py):
+        data.launch_info.launch.creator          (int — Telegram user_id)
+        data.launch_info.launch.creator_address  (str — TON-кошелёк)
+        data.launch_info.launch.name / description / contract_address / ...
+    """
     if not isinstance(detail, dict):
         return
-    # Возможные места, где лежит creator: detail.creator, detail.launch_info.creator,
-    # detail.launch_info.launch.creator, detail.user, detail.owner
-    candidates = []
-    candidates.append(detail.get("creator"))
-    candidates.append(detail.get("user"))
-    candidates.append(detail.get("owner"))
-    li = detail.get("launch_info")
-    if isinstance(li, dict):
-        candidates.append(li.get("creator"))
-        candidates.append(li.get("user"))
-        launch = li.get("launch")
-        if isinstance(launch, dict):
-            candidates.append(launch.get("creator"))
-            candidates.append(launch.get("user"))
-    creator = next((c for c in candidates if isinstance(c, dict) and c), None)
-    if creator:
-        s["creator"] = {
-            "id": first(creator, "id", "user_id", "telegram_id"),
-            "full_name": first(creator, "full_name", "name"),
-            "username": first(creator, "username"),
-        }
-    # Если в деталях есть более точный contract/start_price — обновим
+
     li = detail.get("launch_info") if isinstance(detail.get("launch_info"), dict) else {}
     launch = li.get("launch") if isinstance(li, dict) else None
+
+    # Главный путь: launch.creator как число
+    creator_id: Any = None
     if isinstance(launch, dict):
-        s["contract_address"] = first(launch, "contract_address") or s.get("contract_address")
-        s["start_price"] = first(launch, "start_price") or s.get("start_price")
-        s["end_price"] = first(launch, "end_price") or s.get("end_price")
+        c = launch.get("creator")
+        if isinstance(c, (int, str)):
+            creator_id = c
+        elif isinstance(c, dict):
+            creator_id = first(c, "id", "user_id", "telegram_id")
+            s["creator"]["full_name"] = first(c, "full_name", "name") or s["creator"].get("full_name")
+            s["creator"]["username"] = first(c, "username") or s["creator"].get("username")
+
+    # Запасные места — если бэк когда-нибудь начнёт класть иначе
+    if creator_id is None:
+        for src in (detail.get("creator"), detail.get("user"), detail.get("owner"),
+                    li.get("creator"), li.get("user")):
+            if isinstance(src, (int, str)):
+                creator_id = src
+                break
+            if isinstance(src, dict):
+                cid = first(src, "id", "user_id", "telegram_id")
+                if cid is not None:
+                    creator_id = cid
+                    s["creator"]["full_name"] = first(src, "full_name", "name") or s["creator"].get("full_name")
+                    s["creator"]["username"] = first(src, "username") or s["creator"].get("username")
+                    break
+
+    if creator_id is not None:
+        s["creator"]["id"] = creator_id
+
+    if isinstance(launch, dict):
+        s["contract_address"] = launch.get("contract_address") or s.get("contract_address")
+        s["start_price"] = launch.get("start_price") or s.get("start_price")
+        s["end_price"] = launch.get("end_price") or s.get("end_price")
+        # description пригодится для сообщения
+        if launch.get("description"):
+            s["description"] = launch["description"]
+        if launch.get("creator_address"):
+            s["creator_address"] = launch["creator_address"]
+        # имя лаунча
+        if launch.get("name") and not s.get("name"):
+            s["name"] = launch["name"]
 
 
 async def fetch_launches(client: httpx.AsyncClient) -> list[dict]:
@@ -431,12 +454,15 @@ async def fetch_launches(client: httpx.AsyncClient) -> list[dict]:
 def print_launch(s: dict[str, Any]) -> None:
     coll = s["collection"]
     creator = s["creator"]
+    uname = f"@{creator['username']}" if creator.get("username") else "—"
     print(
         f"[+] NEW LAUNCH  id={s['launch_id']}  status={s['status']}  start={s['start_time']}\n"
         f"    name:       {s['name']!r}\n"
+        f"    description:{s.get('description')!r}\n"
         f"    collection: id={coll['id']}  title={coll['title']!r}  badges={coll['badges']}\n"
-        f"    creator:    id={creator['id']}  username=@{creator['username']}  name={creator['full_name']!r}\n"
-        f"    contract:   {s['contract_address']}\n"
+        f"    creator:    id={creator.get('id')}  username={uname}  name={creator.get('full_name')!r}\n"
+        f"    creator_w:  {s.get('creator_address')}\n"
+        f"    contract:   {s.get('contract_address')}\n"
         f"    url:        {s['url']}",
         flush=True,
     )
@@ -463,26 +489,42 @@ def format_tg_message(s: dict[str, Any]) -> str:
     coll = s["collection"]
     creator = s["creator"]
     name = html_escape(s["name"]) or "—"
+    description = html_escape(s.get("description"))
     coll_title = html_escape(coll.get("title")) or "—"
     coll_id = html_escape(coll.get("id"))
     cu = creator.get("username")
-    cn = html_escape(creator.get("full_name")) or "—"
+    cn = html_escape(creator.get("full_name"))
     cid = html_escape(creator.get("id"))
-    creator_line = f"@{html_escape(cu)} ({cn})" if cu else cn
-    if cid:
-        creator_line += f" • <code>{cid}</code>"
+    if cu:
+        creator_line = f'<a href="https://t.me/{html_escape(cu)}">@{html_escape(cu)}</a>'
+        if cn:
+            creator_line += f" ({cn})"
+    elif cn:
+        creator_line = cn
+    elif cid:
+        creator_line = f"<code>{cid}</code>"
+    else:
+        creator_line = "—"
+
     status = html_escape(s["status"]) or "—"
     start = html_escape(s["start_time"])
     contract = s.get("contract_address")
+    creator_addr = s.get("creator_address")
     url = s.get("url") or ""
 
     parts = [
         "🆕 <b>New Sticker Pack launch</b>",
         f"<b>Pack:</b> {name}",
+    ]
+    if description:
+        parts.append(f"<i>{description}</i>")
+    parts += [
         f"<b>Collection:</b> {coll_title}" + (f" (id <code>{coll_id}</code>)" if coll_id else ""),
         f"<b>Creator:</b> {creator_line}",
         f"<b>Status:</b> {status}   <b>Start:</b> {start}",
     ]
+    if creator_addr:
+        parts.append(f"<b>Creator wallet:</b> <code>{html_escape(creator_addr)}</code>")
     if contract:
         parts.append(f"<b>Contract:</b> <code>{html_escape(contract)}</code>")
     if url:
@@ -523,13 +565,12 @@ async def run_once(client: httpx.AsyncClient, seen: set[str], first_run: bool) -
             continue
         seen.add(lid)
         new_count += 1
-        # Если creator отсутствует — дотягиваем детали через /launch/{id}.
-        if not s["creator"].get("username") and not s["creator"].get("full_name"):
-            try:
-                detail = await fetch_launch_detail(client, lid)
-                merge_detail_into_summary(s, detail)
-            except Exception as e:
-                print(f"[!] detail({lid}): {e}", file=sys.stderr)
+        # Список /launch не отдаёт creator — всегда тянем детали через /launch/{id}.
+        try:
+            detail = await fetch_launch_detail(client, lid)
+            merge_detail_into_summary(s, detail)
+        except Exception as e:
+            print(f"[!] detail({lid}): {e}", file=sys.stderr)
         # Если username всё ещё None — резолвим через Telethon по числовому id.
         if not s["creator"].get("username") and s["creator"].get("id"):
             try:
