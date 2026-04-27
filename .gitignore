@@ -11,3 +11,4 @@ bundle_report.json
 webapp_routes.json
 launches_seen.json
 launches.jsonl
+auth.json
