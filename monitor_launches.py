@@ -249,6 +249,67 @@ def extract_summary(item: dict) -> dict[str, Any]:
     }
 
 
+async def fetch_user_lookup(client: httpx.AsyncClient, user_id: Any) -> dict | None:
+    """GET /api/v1/user/lookup?id=<id> — Stickerdom отдаёт username и имя по числовому id."""
+    if user_id is None:
+        return None
+    try:
+        uid = int(user_id)
+    except Exception:
+        return None
+    url = f"{API_BASE}/api/v1/user/lookup"
+
+    if not TOKENS.locked_to_env and TOKENS.is_expiring():
+        await TOKENS.refresh()
+
+    r = await client.get(url, params={"id": str(uid)}, headers=build_headers(), timeout=TIMEOUT)
+    if r.status_code in (401, 403) and not TOKENS.locked_to_env:
+        if await TOKENS.refresh():
+            r = await client.get(url, params={"id": str(uid)}, headers=build_headers(), timeout=TIMEOUT)
+    if r.status_code != 200:
+        return None
+    try:
+        data = r.json()
+    except Exception:
+        return None
+    if isinstance(data, dict) and data.get("ok") is True and "data" in data:
+        body = data["data"]
+        return body if isinstance(body, dict) else None
+    return data if isinstance(data, dict) else None
+
+
+def find_preview_url(detail: dict | None) -> str | None:
+    """Ищет первую картинку (preview > thumbnail) среди стикеров пака."""
+    if not isinstance(detail, dict):
+        return None
+
+    def walk(obj: Any, want: str) -> str | None:
+        if isinstance(obj, dict):
+            media = obj.get("media")
+            if isinstance(media, list):
+                for m in media:
+                    if isinstance(m, dict) and m.get("type") == want:
+                        url = m.get("url")
+                        if isinstance(url, str) and url:
+                            return url
+            for v in obj.values():
+                r = walk(v, want)
+                if r:
+                    return r
+        elif isinstance(obj, list):
+            for v in obj:
+                r = walk(v, want)
+                if r:
+                    return r
+        return None
+
+    for want in ("preview", "thumbnail"):
+        url = walk(detail, want)
+        if url:
+            return url
+    return None
+
+
 async def fetch_launch_detail(client: httpx.AsyncClient, launch_id: str) -> dict | None:
     """GET /stickerpad/v1/launch/{id} — там обычно полная инфа, включая creator."""
     if not launch_id:
@@ -495,7 +556,8 @@ def print_launch(s: dict[str, Any]) -> None:
         f"    creator_w:  {s.get('creator_address')}\n"
         f"    contract:   {s.get('contract_address')}\n"
         f"    tg_url:     {s.get('url')}\n"
-        f"    web_url:    {s.get('web_url')}",
+        f"    web_url:    {s.get('web_url')}\n"
+        f"    preview:    {s.get('preview_url')}",
         flush=True,
     )
 
@@ -571,11 +633,35 @@ async def notify_telegram(client: httpx.AsyncClient, s: dict[str, Any]) -> None:
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         return
     text = format_tg_message(s)
+    preview = s.get("preview_url")
+
+    # 1) Если есть превью и текст помещается в caption (1024 знака) — sendPhoto.
+    if preview and len(text) <= 1024:
+        photo_payload = {
+            "chat_id": TG_CHAT_ID,
+            "photo": preview,
+            "caption": text,
+            "parse_mode": "HTML",
+        }
+        try:
+            r = await client.post(
+                f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto",
+                json=photo_payload,
+                timeout=TIMEOUT,
+            )
+            if r.status_code == 200:
+                return
+            print(f"[!] sendPhoto failed {r.status_code}: {r.text[:300]}", file=sys.stderr)
+        except httpx.HTTPError as e:
+            print(f"[!] sendPhoto HTTP error: {e}", file=sys.stderr)
+        # упадём на sendMessage, чтобы хоть текст ушёл
+
+    # 2) Без превью или caption не влез — обычный sendMessage.
     payload = {
         "chat_id": TG_CHAT_ID,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": False,
+        "disable_web_page_preview": preview is None,
     }
     try:
         r = await client.post(
@@ -601,17 +687,32 @@ async def run_once(client: httpx.AsyncClient, seen: set[str], first_run: bool) -
         seen.add(lid)
         new_count += 1
         # Список /launch не отдаёт creator — всегда тянем детали через /launch/{id}.
+        detail: dict | None = None
         try:
             detail = await fetch_launch_detail(client, lid)
             merge_detail_into_summary(s, detail)
         except Exception as e:
             print(f"[!] detail({lid}): {e}", file=sys.stderr)
-        # Если username всё ещё None — резолвим через Telethon по числовому id.
-        if not s["creator"].get("username") and s["creator"].get("id"):
+        # Превью — первая картинка из стикеров пака
+        if detail and not s.get("preview_url"):
+            s["preview_url"] = find_preview_url(detail)
+        # Резолвим username/имя в первую очередь через Stickerdom /user/lookup,
+        # затем (если не отдал) — через юзер-бот Telethon.
+        if s["creator"].get("id") and not s["creator"].get("username"):
+            try:
+                u = await fetch_user_lookup(client, s["creator"]["id"])
+                if u:
+                    if not s["creator"].get("username"):
+                        s["creator"]["username"] = u.get("username") or first(u, "user_name", "handle")
+                    if not s["creator"].get("full_name"):
+                        s["creator"]["full_name"] = u.get("full_name") or first(u, "name", "first_name")
+            except Exception as e:
+                print(f"[!] /user/lookup: {e}", file=sys.stderr)
+        if s["creator"].get("id") and not s["creator"].get("username"):
             try:
                 info = await resolve_username(s["creator"]["id"])
                 if info:
-                    s["creator"]["username"] = info.get("username")
+                    s["creator"]["username"] = info.get("username") or s["creator"].get("username")
                     if not s["creator"].get("full_name"):
                         s["creator"]["full_name"] = info.get("full_name")
             except Exception as e:
