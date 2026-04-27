@@ -27,7 +27,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import httpx
 from dotenv import load_dotenv
@@ -68,14 +68,16 @@ async def fetch_init_data() -> str:
     await client.disconnect()
 
     parsed = urlparse(res.url)
-    # Telegram кладёт параметры во fragment: ...#tgWebAppData=...&tgWebAppVersion=...
+    # Telegram кладёт параметры во fragment: ...#tgWebAppData=<urlencoded>&tgWebAppVersion=...
     frag = parsed.fragment or parsed.query
+    # parse_qs декодирует один уровень — оставляет inner-encoding (например, user=%7B...%7D),
+    # а именно эту форму бэк хеширует и валидирует. Никакого unquote сверху делать НЕЛЬЗЯ,
+    # иначе init_data_hash не сойдётся.
     qs = parse_qs(frag, keep_blank_values=True)
     raw = qs.get("tgWebAppData", [""])[0]
     if not raw:
         raise RuntimeError(f"tgWebAppData не найден в URL: {res.url}")
-    # tgWebAppData приходит уже urlencoded — это "query_id=...&user=...&auth_date=...&hash=..."
-    return unquote(raw)
+    return raw
 
 
 def looks_like_token(value: str) -> bool:
@@ -95,6 +97,16 @@ def extract_token(payload: dict) -> str | None:
     return None
 
 
+def _ascii_safe_header(value: str) -> str:
+    """HTTP-заголовки требуют ASCII. Телеграмовский initData может содержать
+    кириллицу в user.first_name — поэтому отдаём его percent-encoded."""
+    try:
+        value.encode("ascii")
+        return value
+    except UnicodeEncodeError:
+        return quote(value, safe="=&%")
+
+
 async def try_auth(client: httpx.AsyncClient, init_data: str) -> dict | None:
     headers_base = {
         "User-Agent": UA,
@@ -102,16 +114,20 @@ async def try_auth(client: httpx.AsyncClient, init_data: str) -> dict | None:
         "Origin": "https://stickerdom.store",
         "Referer": "https://stickerdom.store/",
     }
+    safe_init = _ascii_safe_header(init_data)
     candidates = [
-        # path, json body, extra headers
-        ("/api/v1/auth", {"init_data": init_data}, {}),
-        ("/api/v1/auth", {"initData": init_data}, {}),
-        ("/api/v1/auth", {"data": init_data}, {}),
-        ("/api/v1/auth", None, {"X-Telegram-Init-Data": init_data, "Telegram-Init-Data": init_data}),
-        ("/api/v1/auth/login", {"init_data": init_data}, {}),
-        ("/api/v1/auth/telegram", {"init_data": init_data}, {}),
+        # path, json body, extra headers, label
+        ("/api/v1/auth", {"init_data": init_data}, {}, "json:init_data"),
+        ("/api/v1/auth", {"initData": init_data}, {}, "json:initData"),
+        ("/api/v1/auth", {"data": init_data}, {}, "json:data"),
+        ("/api/v1/auth", {"telegram_init_data": init_data}, {}, "json:telegram_init_data"),
+        ("/api/v1/auth", None, {"Authorization": f"tma {safe_init}"}, "header:Authorization tma"),
+        ("/api/v1/auth", None, {"X-Telegram-Init-Data": safe_init}, "header:X-Telegram-Init-Data"),
+        ("/api/v1/auth", None, {"Telegram-Init-Data": safe_init}, "header:Telegram-Init-Data"),
+        ("/api/v1/auth/login", {"init_data": init_data}, {}, "login json:init_data"),
+        ("/api/v1/auth/telegram", {"init_data": init_data}, {}, "telegram json:init_data"),
     ]
-    for path, body, extra in candidates:
+    for path, body, extra, label in candidates:
         url = f"{API_BASE}{path}"
         headers = {**headers_base, **extra}
         try:
@@ -120,19 +136,22 @@ async def try_auth(client: httpx.AsyncClient, init_data: str) -> dict | None:
             else:
                 r = await client.post(url, json=body, headers=headers, timeout=20)
         except httpx.HTTPError as e:
-            print(f"  - {path}  body={list(body) if body else 'header'}  → {e}")
+            print(f"  - {path}  [{label}]  → {e}")
             continue
         snippet = r.text[:200].replace("\n", " ")
-        print(f"  - {path}  body={list(body) if body else 'header'}  → {r.status_code}  {snippet!r}")
+        print(f"  - {path}  [{label}]  → {r.status_code}  {snippet!r}")
         if r.status_code != 200:
             continue
         try:
             data = r.json()
         except Exception:
             continue
+        # API отдаёт {"ok": false, "errorCode": ...} с 200 — лечим так:
+        if isinstance(data, dict) and data.get("ok") is False:
+            continue
         token = extract_token(data)
         if token:
-            return {"path": path, "body_keys": list(body) if body else None, "headers": list(extra), "response": data, "token": token}
+            return {"path": path, "label": label, "response": data, "token": token}
     return None
 
 
