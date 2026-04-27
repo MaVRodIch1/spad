@@ -79,7 +79,7 @@ async def main() -> None:
     OUT_DIR.mkdir(exist_ok=True)
     base_host = urlparse(BASE_URL).netloc
 
-    async with httpx.AsyncClient(http2=True, headers={"User-Agent": UA}) as client:
+    async with httpx.AsyncClient(headers={"User-Agent": UA}) as client:
         print(f"[*] GET {BASE_URL}")
         r = await fetch(client, BASE_URL)
         index_html = r.text
