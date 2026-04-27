@@ -32,7 +32,10 @@ from urllib.parse import parse_qs, quote, urlparse
 import httpx
 from dotenv import load_dotenv
 from telethon import TelegramClient
-from telethon.tl.functions.messages import RequestWebViewRequest
+from telethon.tl.functions.messages import (
+    RequestWebViewRequest,
+    RequestSimpleWebViewRequest,
+)
 
 load_dotenv()
 
@@ -52,32 +55,64 @@ UA = (
 )
 
 
-async def fetch_init_data() -> str:
+def _extract_tgwebappdata(url: str) -> str:
+    """Достаёт raw URL-encoded tgWebAppData из URL мини-аппа."""
+    parsed = urlparse(url)
+    frag = parsed.fragment or parsed.query
+    # parse_qs декодирует один уровень → user=%7B...%7D остаётся как есть.
+    # Эту форму бэк HMAC'ит и валидирует — лишний unquote ломает подпись.
+    qs = parse_qs(frag, keep_blank_values=True)
+    return qs.get("tgWebAppData", [""])[0]
+
+
+async def fetch_init_data_variants() -> list[tuple[str, str]]:
+    """Возвращает список (label, init_data) — initData, полученные разными методами.
+    У @sticker_bot мини-апп может быть привязан к menu/main-menu, и Telegram
+    подписывает initData по-разному в зависимости от способа открытия."""
     client = TelegramClient(SESSION, API_ID, API_HASH)
     await client.start(phone=PHONE)
     bot = await client.get_entity(TARGET)
-    res = await client(
-        RequestWebViewRequest(
-            peer=bot,
-            bot=bot,
-            platform=PLATFORM,
-            from_bot_menu=False,
-            url=WEBAPP_URL,
-        )
-    )
-    await client.disconnect()
 
-    parsed = urlparse(res.url)
-    # Telegram кладёт параметры во fragment: ...#tgWebAppData=<urlencoded>&tgWebAppVersion=...
-    frag = parsed.fragment or parsed.query
-    # parse_qs декодирует один уровень — оставляет inner-encoding (например, user=%7B...%7D),
-    # а именно эту форму бэк хеширует и валидирует. Никакого unquote сверху делать НЕЛЬЗЯ,
-    # иначе init_data_hash не сойдётся.
-    qs = parse_qs(frag, keep_blank_values=True)
-    raw = qs.get("tgWebAppData", [""])[0]
-    if not raw:
-        raise RuntimeError(f"tgWebAppData не найден в URL: {res.url}")
-    return raw
+    variants: list[tuple[str, str]] = []
+
+    async def try_method(label: str, coro):
+        try:
+            res = await coro
+            init = _extract_tgwebappdata(res.url)
+            if init:
+                variants.append((label, init))
+                print(f"  [+] {label}: init_data len={len(init)}")
+            else:
+                print(f"  [-] {label}: tgWebAppData не найден ({res.url[:120]})")
+        except Exception as e:
+            print(f"  [-] {label}: {type(e).__name__}: {e}")
+
+    # 1. RequestWebView — соответствует клику по inline-кнопке KeyboardButtonWebView.
+    await try_method(
+        "WebView (from_bot_menu=False)",
+        client(RequestWebViewRequest(peer=bot, bot=bot, platform=PLATFORM, from_bot_menu=False, url=WEBAPP_URL)),
+    )
+    await try_method(
+        "WebView (from_bot_menu=True)",
+        client(RequestWebViewRequest(peer=bot, bot=bot, platform=PLATFORM, from_bot_menu=True, url=WEBAPP_URL)),
+    )
+
+    # 2. RequestSimpleWebView — для menu-button и side-menu, без peer.
+    await try_method(
+        "SimpleWebView (default)",
+        client(RequestSimpleWebViewRequest(bot=bot, platform=PLATFORM, url=WEBAPP_URL)),
+    )
+    await try_method(
+        "SimpleWebView (from_side_menu=True)",
+        client(RequestSimpleWebViewRequest(bot=bot, platform=PLATFORM, url=WEBAPP_URL, from_side_menu=True)),
+    )
+    await try_method(
+        "SimpleWebView (from_switch_webview=True)",
+        client(RequestSimpleWebViewRequest(bot=bot, platform=PLATFORM, url=WEBAPP_URL, from_switch_webview=True)),
+    )
+
+    await client.disconnect()
+    return variants
 
 
 def looks_like_token(value: str) -> bool:
@@ -157,45 +192,66 @@ async def try_auth(client: httpx.AsyncClient, init_data: str) -> dict | None:
 
 async def main() -> None:
     print(f"[*] Получаю initData через Telethon (peer={TARGET}, url={WEBAPP_URL})…")
-    init_data = await fetch_init_data()
-    print(f"[+] initData: {init_data[:80]}…  (len={len(init_data)})")
-
-    print(f"[*] Пробую auth на {API_BASE}…")
-    async with httpx.AsyncClient() as http:
-        result = await try_auth(http, init_data)
-
-    if not result:
-        print("\n[!] Ни один из вариантов auth не сработал.", file=sys.stderr)
-        print(
-            "    Открой DevTools мини-аппа https://stickerdom.store, найди в Network "
-            "запрос, который отдаёт access_token, и скажи мне его путь/формат — "
-            "добавлю.",
-            file=sys.stderr,
-        )
-        OUT_FILE.write_text(
-            json.dumps({"init_data": init_data, "saved_at": datetime.now(timezone.utc).isoformat()}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+    variants = await fetch_init_data_variants()
+    if not variants:
+        print("[!] Не удалось получить ни одного initData.", file=sys.stderr)
         sys.exit(1)
 
+    print(f"\n[*] Пробую auth на {API_BASE} для {len(variants)} вариантов initData…")
+    last_init = ""
+    async with httpx.AsyncClient() as http:
+        for label, init_data in variants:
+            print(f"\n=== initData: {label} ===")
+            last_init = init_data
+            result = await try_auth(http, init_data)
+            if result:
+                OUT_FILE.write_text(
+                    json.dumps(
+                        {
+                            "saved_at": datetime.now(timezone.utc).isoformat(),
+                            "init_data_method": label,
+                            "auth_path": result["path"],
+                            "auth_label": result["label"],
+                            "init_data": init_data,
+                            "token": result["token"],
+                            "response": result["response"],
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                print("\n[+] Получили токен!")
+                print(f"    initData получен через: {label}")
+                print(f"    auth: {result['path']}  [{result['label']}]")
+                print(f"    Сохранил в {OUT_FILE}")
+                print("\nЗапусти monitor так:")
+                print(
+                    f"  AUTH_HEADER='Authorization: Bearer {result['token']}' "
+                    "python monitor_launches.py"
+                )
+                return
+
+    print("\n[!] Ни один из вариантов auth не сработал.", file=sys.stderr)
+    print(
+        "    Сохраню последний initData в auth.json для отладки. "
+        "Открой DevTools мини-аппа и сравни запрос /api/v1/auth — "
+        "поле и формат initData, заголовки, метод.",
+        file=sys.stderr,
+    )
     OUT_FILE.write_text(
         json.dumps(
             {
+                "init_data": last_init,
                 "saved_at": datetime.now(timezone.utc).isoformat(),
-                "auth_path": result["path"],
-                "init_data": init_data,
-                "token": result["token"],
-                "response": result["response"],
+                "tried_methods": [v[0] for v in variants],
             },
             ensure_ascii=False,
             indent=2,
         ),
         encoding="utf-8",
     )
-    print("\n[+] Получили токен!")
-    print(f"    Сохранил в {OUT_FILE}")
-    print("\nЗапусти monitor так:")
-    print(f"  AUTH_HEADER='Authorization: Bearer {result['token']}' python monitor_launches.py")
+    sys.exit(1)
 
 
 if __name__ == "__main__":
