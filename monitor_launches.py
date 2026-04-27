@@ -39,6 +39,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Telethon мы импортируем лениво — он нужен только для резолва username по id.
+_telethon_client = None
+_telethon_lock = asyncio.Lock()
+USER_CACHE_FILE = Path(os.environ.get("USER_CACHE_FILE", "users_cache.json"))
+
 API_BASE = os.environ.get("API_BASE_URL", "https://api.stickerdom.store")
 STICKERPAD = os.environ.get("STICKERPAD_PATH", "/stickerpad/v1")
 LIMIT = int(os.environ.get("LIMIT", "20"))
@@ -266,6 +271,83 @@ async def fetch_launch_detail(client: httpx.AsyncClient, launch_id: str) -> dict
     return data if isinstance(data, dict) else None
 
 
+def _load_user_cache() -> dict[str, dict[str, Any]]:
+    if not USER_CACHE_FILE.exists():
+        return {}
+    try:
+        return json.loads(USER_CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_user_cache(cache: dict[str, dict[str, Any]]) -> None:
+    try:
+        USER_CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[!] cache save: {e}", file=sys.stderr)
+
+
+_user_cache: dict[str, dict[str, Any]] | None = None
+
+
+async def resolve_username(user_id: Any) -> dict[str, Any] | None:
+    """По числовому Telegram user_id возвращает {id, username, full_name}.
+    Использует юзер-бот Telethon (та же сессия что у get_token.py)."""
+    global _telethon_client, _user_cache
+    if user_id is None:
+        return None
+    try:
+        uid = int(user_id)
+    except Exception:
+        return None
+    key = str(uid)
+
+    if _user_cache is None:
+        _user_cache = _load_user_cache()
+    if key in _user_cache:
+        return _user_cache[key]
+
+    try:
+        from telethon import TelegramClient
+    except ImportError:
+        return None
+
+    api_id = os.environ.get("TG_API_ID")
+    api_hash = os.environ.get("TG_API_HASH")
+    if not api_id or not api_hash:
+        return None
+
+    async with _telethon_lock:
+        if _telethon_client is None:
+            client = TelegramClient(
+                os.environ.get("TG_SESSION", "userbot"),
+                int(api_id),
+                api_hash,
+            )
+            await client.start(phone=os.environ.get("TG_PHONE"))
+            _telethon_client = client
+        try:
+            entity = await _telethon_client.get_entity(uid)
+        except Exception as e:
+            print(f"[!] resolve {uid}: {type(e).__name__}: {e}", file=sys.stderr)
+            entity = None
+
+    if entity is None:
+        info = {"id": uid, "username": None, "full_name": None}
+    else:
+        first_name = getattr(entity, "first_name", None) or ""
+        last_name = getattr(entity, "last_name", None) or ""
+        full = (first_name + " " + last_name).strip() or None
+        info = {
+            "id": uid,
+            "username": getattr(entity, "username", None),
+            "full_name": full,
+        }
+    _user_cache[key] = info
+    _save_user_cache(_user_cache)
+    return info
+
+
 def merge_detail_into_summary(s: dict[str, Any], detail: dict | None) -> None:
     """Дописывает в summary creator/прочее из ответа /launch/{id}."""
     if not isinstance(detail, dict):
@@ -448,6 +530,16 @@ async def run_once(client: httpx.AsyncClient, seen: set[str], first_run: bool) -
                 merge_detail_into_summary(s, detail)
             except Exception as e:
                 print(f"[!] detail({lid}): {e}", file=sys.stderr)
+        # Если username всё ещё None — резолвим через Telethon по числовому id.
+        if not s["creator"].get("username") and s["creator"].get("id"):
+            try:
+                info = await resolve_username(s["creator"]["id"])
+                if info:
+                    s["creator"]["username"] = info.get("username")
+                    if not s["creator"].get("full_name"):
+                        s["creator"]["full_name"] = info.get("full_name")
+            except Exception as e:
+                print(f"[!] resolve creator: {e}", file=sys.stderr)
         print_launch(s)
         append_log(s)
         if will_notify:
@@ -500,8 +592,19 @@ async def main() -> None:
             await asyncio.sleep(POLL_INTERVAL)
 
 
+async def _entrypoint() -> None:
+    try:
+        await main()
+    finally:
+        if _telethon_client is not None:
+            try:
+                await _telethon_client.disconnect()
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(_entrypoint())
     except KeyboardInterrupt:
         pass

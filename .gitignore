@@ -12,3 +12,4 @@ webapp_routes.json
 launches_seen.json
 launches.jsonl
 auth.json
+users_cache.json
