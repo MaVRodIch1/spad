@@ -585,7 +585,6 @@ def format_tg_message(s: dict[str, Any]) -> str:
     name = html_escape(s["name"]) or "—"
     description = html_escape(s.get("description"))
     coll_title = html_escape(coll.get("title")) or "—"
-    coll_id = html_escape(coll.get("id"))
     cu = creator.get("username")
     cn = html_escape(creator.get("full_name"))
     cid = html_escape(creator.get("id"))
@@ -600,10 +599,6 @@ def format_tg_message(s: dict[str, Any]) -> str:
     else:
         creator_line = "—"
 
-    status = html_escape(s["status"]) or "—"
-    start = html_escape(s["start_time"])
-    contract = s.get("contract_address")
-    creator_addr = s.get("creator_address")
     url = s.get("url") or ""
 
     parts = [
@@ -613,14 +608,9 @@ def format_tg_message(s: dict[str, Any]) -> str:
     if description:
         parts.append(f"<i>{description}</i>")
     parts += [
-        f"<b>Collection:</b> {coll_title}" + (f" (id <code>{coll_id}</code>)" if coll_id else ""),
+        f"<b>Collection:</b> {coll_title}",
         f"<b>Creator:</b> {creator_line}",
-        f"<b>Status:</b> {status}   <b>Start:</b> {start}",
     ]
-    if creator_addr:
-        parts.append(f"<b>Creator wallet:</b> <code>{html_escape(creator_addr)}</code>")
-    if contract:
-        parts.append(f"<b>Contract:</b> <code>{html_escape(contract)}</code>")
     if url:
         parts.append(f'<a href="{html_escape(url)}">▶ Open in Telegram</a>')
     return "\n".join(parts)
