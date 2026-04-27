@@ -27,7 +27,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 from dotenv import load_dotenv
@@ -132,44 +132,28 @@ def extract_token(payload: dict) -> str | None:
     return None
 
 
-def _ascii_safe_header(value: str) -> str:
-    """HTTP-заголовки требуют ASCII. Телеграмовский initData может содержать
-    кириллицу в user.first_name — поэтому отдаём его percent-encoded."""
-    try:
-        value.encode("ascii")
-        return value
-    except UnicodeEncodeError:
-        return quote(value, safe="=&%")
-
-
 async def try_auth(client: httpx.AsyncClient, init_data: str) -> dict | None:
+    """Бэк (см. бандл) ждёт POST /api/v1/auth с multipart/form-data полем initData."""
     headers_base = {
         "User-Agent": UA,
         "Accept": "application/json",
         "Origin": "https://stickerdom.store",
         "Referer": "https://stickerdom.store/",
     }
-    safe_init = _ascii_safe_header(init_data)
+    path = "/api/v1/auth"
+    url = f"{API_BASE}{path}"
+
+    # Главный кандидат — то, что реально шлёт фронт.
     candidates = [
-        # path, json body, extra headers, label
-        ("/api/v1/auth", {"init_data": init_data}, {}, "json:init_data"),
-        ("/api/v1/auth", {"initData": init_data}, {}, "json:initData"),
-        ("/api/v1/auth", {"data": init_data}, {}, "json:data"),
-        ("/api/v1/auth", {"telegram_init_data": init_data}, {}, "json:telegram_init_data"),
-        ("/api/v1/auth", None, {"Authorization": f"tma {safe_init}"}, "header:Authorization tma"),
-        ("/api/v1/auth", None, {"X-Telegram-Init-Data": safe_init}, "header:X-Telegram-Init-Data"),
-        ("/api/v1/auth", None, {"Telegram-Init-Data": safe_init}, "header:Telegram-Init-Data"),
-        ("/api/v1/auth/login", {"init_data": init_data}, {}, "login json:init_data"),
-        ("/api/v1/auth/telegram", {"init_data": init_data}, {}, "telegram json:init_data"),
+        ("multipart:initData", lambda: client.post(url, headers=headers_base, files={"initData": (None, init_data)}, timeout=20)),
+        ("form:initData", lambda: client.post(url, headers=headers_base, data={"initData": init_data}, timeout=20)),
+        ("multipart:init_data", lambda: client.post(url, headers=headers_base, files={"init_data": (None, init_data)}, timeout=20)),
+        ("form:init_data", lambda: client.post(url, headers=headers_base, data={"init_data": init_data}, timeout=20)),
     ]
-    for path, body, extra, label in candidates:
-        url = f"{API_BASE}{path}"
-        headers = {**headers_base, **extra}
+
+    for label, do_request in candidates:
         try:
-            if body is None:
-                r = await client.post(url, headers=headers, timeout=20)
-            else:
-                r = await client.post(url, json=body, headers=headers, timeout=20)
+            r = await do_request()
         except httpx.HTTPError as e:
             print(f"  - {path}  [{label}]  → {e}")
             continue
@@ -181,7 +165,6 @@ async def try_auth(client: httpx.AsyncClient, init_data: str) -> dict | None:
             data = r.json()
         except Exception:
             continue
-        # API отдаёт {"ok": false, "errorCode": ...} с 200 — лечим так:
         if isinstance(data, dict) and data.get("ok") is False:
             continue
         token = extract_token(data)
