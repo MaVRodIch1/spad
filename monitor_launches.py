@@ -46,6 +46,8 @@ USER_CACHE_FILE = Path(os.environ.get("USER_CACHE_FILE", "users_cache.json"))
 
 API_BASE = os.environ.get("API_BASE_URL", "https://api.stickerdom.store")
 STICKERPAD = os.environ.get("STICKERPAD_PATH", "/stickerpad/v1")
+# Имя бота, в чей мини-апп шарим лаунч. Используется для t.me/<bot>?startapp=lid_<id>
+TARGET_BOT = os.environ.get("TG_TARGET", "sticker_bot")
 LIMIT = int(os.environ.get("LIMIT", "20"))
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "30"))
 STATE_FILE = Path(os.environ.get("STATE_FILE", "launches_seen.json"))
@@ -242,7 +244,8 @@ def extract_summary(item: dict) -> dict[str, Any]:
             "full_name": first(creator, "full_name", "name"),
             "username": first(creator, "username"),
         },
-        "url": f"https://stickerdom.store/launch-item/{launch_id}" if launch_id else None,
+        "url": f"https://t.me/{TARGET_BOT}?startapp=lid_{launch_id}" if launch_id else None,
+        "web_url": f"https://stickerdom.store/launch-item/{launch_id}" if launch_id else None,
     }
 
 
@@ -292,7 +295,9 @@ _user_cache: dict[str, dict[str, Any]] | None = None
 
 async def resolve_username(user_id: Any) -> dict[str, Any] | None:
     """По числовому Telegram user_id возвращает {id, username, full_name}.
-    Использует юзер-бот Telethon (та же сессия что у get_token.py)."""
+    Использует юзер-бот Telethon (та же сессия что у get_token.py).
+    Пробует несколько методов, чтобы вытащить инфу о юзерах, которых
+    юзербот никогда не встречал."""
     global _telethon_client, _user_cache
     if user_id is None:
         return None
@@ -309,6 +314,8 @@ async def resolve_username(user_id: Any) -> dict[str, Any] | None:
 
     try:
         from telethon import TelegramClient
+        from telethon.tl.functions.users import GetFullUserRequest, GetUsersRequest
+        from telethon.tl.types import InputUser, PeerUser
     except ImportError:
         return None
 
@@ -326,14 +333,38 @@ async def resolve_username(user_id: Any) -> dict[str, Any] | None:
             )
             await client.start(phone=os.environ.get("TG_PHONE"))
             _telethon_client = client
+
+        entity = None
+        # 1) Самый простой и быстрый — get_entity по числу
         try:
             entity = await _telethon_client.get_entity(uid)
-        except Exception as e:
-            print(f"[!] resolve {uid}: {type(e).__name__}: {e}", file=sys.stderr)
+        except Exception:
             entity = None
+        # 2) Через PeerUser
+        if entity is None:
+            try:
+                entity = await _telethon_client.get_entity(PeerUser(uid))
+            except Exception:
+                entity = None
+        # 3) GetUsersRequest с access_hash=0 — иногда выезжает для публичных
+        if entity is None:
+            try:
+                users = await _telethon_client(GetUsersRequest(id=[InputUser(uid, 0)]))
+                if users and users[0].__class__.__name__ != "UserEmpty":
+                    entity = users[0]
+            except Exception:
+                entity = None
+        # 4) Полный fetch — может подтянуть кэш в сессию
+        if entity is None:
+            try:
+                full = await _telethon_client(GetFullUserRequest(InputUser(uid, 0)))
+                if full and getattr(full, "users", None):
+                    entity = full.users[0]
+            except Exception:
+                entity = None
 
     if entity is None:
-        info = {"id": uid, "username": None, "full_name": None}
+        info: dict[str, Any] = {"id": uid, "username": None, "full_name": None}
     else:
         first_name = getattr(entity, "first_name", None) or ""
         last_name = getattr(entity, "last_name", None) or ""
@@ -463,7 +494,8 @@ def print_launch(s: dict[str, Any]) -> None:
         f"    creator:    id={creator.get('id')}  username={uname}  name={creator.get('full_name')!r}\n"
         f"    creator_w:  {s.get('creator_address')}\n"
         f"    contract:   {s.get('contract_address')}\n"
-        f"    url:        {s['url']}",
+        f"    tg_url:     {s.get('url')}\n"
+        f"    web_url:    {s.get('web_url')}",
         flush=True,
     )
 
@@ -527,8 +559,11 @@ def format_tg_message(s: dict[str, Any]) -> str:
         parts.append(f"<b>Creator wallet:</b> <code>{html_escape(creator_addr)}</code>")
     if contract:
         parts.append(f"<b>Contract:</b> <code>{html_escape(contract)}</code>")
+    web_url = s.get("web_url") or ""
     if url:
-        parts.append(f'<a href="{html_escape(url)}">Open in Sticker Pack</a>')
+        parts.append(f'<a href="{html_escape(url)}">▶ Open in Telegram</a>')
+    if web_url:
+        parts.append(f'<a href="{html_escape(web_url)}">Open in browser</a>')
     return "\n".join(parts)
 
 
