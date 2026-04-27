@@ -27,7 +27,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 from dotenv import load_dotenv
@@ -53,6 +53,40 @@ UA = (
     "Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36 Telegram-Android/10.13"
 )
+
+
+def parse_init_data(init_data: str) -> dict[str, str]:
+    """Парсит сырую initData (a=b&c=d&...) в словарь, не теряя URL-кодировку."""
+    out: dict[str, str] = {}
+    for chunk in init_data.split("&"):
+        if "=" not in chunk:
+            continue
+        k, _, v = chunk.partition("=")
+        out[unquote(k)] = unquote(v)
+    return out
+
+
+def dump_init_data(label: str, init_data: str) -> None:
+    print(f"\n--- {label} ---")
+    print(f"raw len={len(init_data)}")
+    print(f"raw[:120]: {init_data[:120]}")
+    fields = parse_init_data(init_data)
+    print(f"keys: {sorted(fields)}")
+    for k, v in fields.items():
+        if k == "user":
+            try:
+                user = json.loads(v)
+                print(f"  user.keys: {sorted(user)}")
+                for uk, uv in user.items():
+                    print(f"    user.{uk} = {uv!r}")
+            except Exception:
+                print(f"  user (raw): {v[:200]}")
+        elif k == "hash":
+            print(f"  hash      = {v}  (len={len(v)})")
+        elif k == "signature":
+            print(f"  signature = {v}  (len={len(v)})")
+        else:
+            print(f"  {k} = {v[:120]}")
 
 
 def _extract_tgwebappdata(url: str) -> str:
@@ -179,6 +213,10 @@ async def main() -> None:
     if not variants:
         print("[!] Не удалось получить ни одного initData.", file=sys.stderr)
         sys.exit(1)
+
+    # Диагностика: разбираем все полученные initData и печатаем их поля
+    for label, init_data in variants:
+        dump_init_data(label, init_data)
 
     print(f"\n[*] Пробую auth на {API_BASE} для {len(variants)} вариантов initData…")
     last_init = ""
