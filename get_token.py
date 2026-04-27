@@ -153,6 +153,10 @@ def looks_like_token(value: str) -> bool:
     return isinstance(value, str) and len(value) > 20 and "." in value or len(value) > 32
 
 
+def _looks_like_jwt(s: str) -> bool:
+    return isinstance(s, str) and s.count(".") == 2 and len(s) > 40
+
+
 def extract_token(payload: dict) -> str | None:
     if not isinstance(payload, dict):
         return None
@@ -161,6 +165,9 @@ def extract_token(payload: dict) -> str | None:
         if isinstance(v, str) and v:
             return v
     data = payload.get("data")
+    if isinstance(data, str) and _looks_like_jwt(data):
+        # Stickerdom отдаёт {"ok": true, "data": "<JWT>"}
+        return data
     if isinstance(data, dict):
         return extract_token(data)
     return None
